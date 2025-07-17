@@ -11,8 +11,8 @@ class PoligonScraper:
     def __init__(self):
         
         self.playwright = None
-        self.browser: Browser = None
-        self.page: Page = None
+        self.browser: Browser = None # type: ignore
+        self.page: Page = None # type: ignore
         self.url = "https://www.gestiondepoligonos.com/poligonos-industriales-Madrid"
         self.names: List[str] = []
     
