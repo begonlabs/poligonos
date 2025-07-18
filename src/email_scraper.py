@@ -90,15 +90,15 @@ class ConcurrentContactVerifier:
         
         self.browsers = []
         self.browser_queue = asyncio.Queue()
-
+        self.playwright = None
 
     async def initialize_browsers(self):
         logger.info(f"Inicializando {self.max_browsers} navegadores...")
         
-        playwright = await async_playwright().start()
+        self.playwright = await async_playwright().start()
         
         for i in range(self.max_browsers):
-            browser = await playwright.chromium.launch(
+            browser = await self.playwright.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -113,23 +113,26 @@ class ConcurrentContactVerifier:
             self.browsers.append(browser)
             await self.browser_queue.put(browser)
 
-
     async def get_browser(self) -> Browser:
         async with self.browser_semaphore:
             return await self.browser_queue.get()
 
-
     async def return_browser(self, browser: Browser):
         await self.browser_queue.put(browser)
 
-
     async def cleanup_browsers(self):
+        logger.info("Cerrando navegadores...")
         for browser in self.browsers:
             try:
                 await browser.close()
             except:
                 pass
-
+        self.browsers.clear()
+        
+        try:
+            await self.playwright.stop()
+        except:
+            pass
 
     def is_valid_email(self, email: str) -> bool:
         if not email:
@@ -215,7 +218,6 @@ class ConcurrentContactVerifier:
         
         return True
 
-
     def normalize_phone(self, phone: str) -> str:
         if not phone:
             return ""
@@ -231,10 +233,14 @@ class ConcurrentContactVerifier:
             
         return clean_phone
 
-
     async def extract_contacts_from_page(self, page: Page, url: str) -> Tuple[List[str], List[str]]:
         try:
-            await page.goto(url, timeout=15000, wait_until='domcontentloaded')
+            response = await page.goto(url, timeout=20000, wait_until='domcontentloaded')
+            
+            if not response or response.status >= 400:
+                return [], []
+            
+            await page.wait_for_timeout(2000)
             
             content = await page.content()
             
@@ -261,8 +267,8 @@ class ConcurrentContactVerifier:
             return emails, phones
             
         except Exception as e:
+            logger.warning(f"Error extrayendo contactos de {url}: {str(e)}")
             return [], []
-
 
     async def verify_business_contacts_worker(self, business: Dict, business_index: int, total_businesses: int) -> Dict:
         async with self.semaphore:
@@ -289,12 +295,22 @@ class ConcurrentContactVerifier:
                 return result
             
             browser = None
+            context = None
+            page = None
+            
             try:
                 browser = await self.get_browser()
+                
                 context = await browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    viewport={'width': 1920, 'height': 1080},
+                    ignore_https_errors=True
                 )
+                
                 page = await context.new_page()
+                await page.set_extra_http_headers({
+                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+                })
                 
                 all_emails = set()
                 all_phones = set()
@@ -310,12 +326,11 @@ class ConcurrentContactVerifier:
                         all_emails.update(emails)
                         all_phones.update(phones)
                         
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1)
                         
                     except Exception as e:
+                        logger.warning(f"Error en {url}: {str(e)}")
                         continue
-                
-                await context.close()
                 
                 result['verification_results']['emails_found'] = list(all_emails)
                 result['verification_results']['phones_found'] = list(all_phones)
@@ -343,14 +358,26 @@ class ConcurrentContactVerifier:
                 
             except Exception as e:
                 result['verification_results']['error'] = str(e)
+                logger.error(f"Error procesando {company_name}: {str(e)}")
             
             finally:
+                try:
+                    if page:
+                        await page.close()
+                except:
+                    pass
+                
+                try:
+                    if context:
+                        await context.close()
+                except:
+                    pass
+                
                 if browser:
                     await self.return_browser(browser)
             
             await self.update_progress(result, business_index, total_businesses)
             return result
-
 
     async def update_progress(self, result: Dict, business_index: int, total_businesses: int):
         with self.progress_lock:
@@ -362,14 +389,12 @@ class ConcurrentContactVerifier:
             if result.get('verification_results', {}).get('phone_verified'):
                 self.verified_phones_count += 1
 
-
     def get_input_files(self) -> List[str]:
         script_dir = Path(__file__).parent
         data_dir = script_dir.parent / "data"
         pattern = data_dir / "negocios_*.json"
         return glob.glob(str(pattern))
     
-
     def get_processed_files(self) -> set:
         processed_files = set()
         script_dir = Path(__file__).parent
@@ -383,7 +408,6 @@ class ConcurrentContactVerifier:
             original_path = str(data_dir / original_name)
             processed_files.add(original_path)
         return processed_files
-
 
     async def process_single_file(self, input_file: str):
         try:
@@ -446,7 +470,6 @@ class ConcurrentContactVerifier:
             logger.error(f"Error procesando archivo {input_file}: {str(e)}")
             await self.cleanup_browsers()
 
-
     async def process_all_files(self):
         input_files = self.get_input_files()
         processed_files = self.get_processed_files()
@@ -474,7 +497,6 @@ class ConcurrentContactVerifier:
         
         logger.info("Todos los archivos han sido procesados")
 
-
 async def main():
     MAX_WORKERS = 3
     MAX_BROWSERS = 2
@@ -489,8 +511,6 @@ async def main():
         
     except Exception as e:
         logger.error(f"Error general: {e}")
-
-
 
 if __name__ == "__main__":
     if hasattr(asyncio, 'WindowsProactorEventLoopPolicy'):
